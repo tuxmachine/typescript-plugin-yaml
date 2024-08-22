@@ -1,31 +1,28 @@
 import path from 'path';
 import fs from 'fs';
 import jsYaml from 'js-yaml';
-import { VALID_VARIABLE_NAME_REGEX } from './constants'
+import { VALID_VARIABLE_NAME_REGEX } from './constants';
+import type tsModule from 'typescript/lib/tsserverlibrary';
 
-export = function init(modules: {
-  typescript: typeof import('typescript/lib/tsserverlibrary');
-}) {
-  const ts = modules.typescript;
-
-  function create(info: ts.server.PluginCreateInfo) {
+const init: tsModule.server.PluginModuleFactory = ({ typescript: ts }) => {
+  function create(
+    info: tsModule.server.PluginCreateInfo,
+  ): tsModule.LanguageService {
     const logger = info.project.projectService.logger;
+    const languageServiceHost = {} as Partial<tsModule.LanguageServiceHost>;
 
-    const _getScriptKind = info.languageServiceHost.getScriptKind?.bind(
-      info.languageServiceHost,
-    );
+    const languageServiceHostProxy = new Proxy(info.languageServiceHost, {
+      get(target, key: keyof tsModule.LanguageServiceHost) {
+        return languageServiceHost[key]
+          ? languageServiceHost[key]
+          : target[key];
+      },
+    });
 
-    const _getScriptSnapshot = info.languageServiceHost.getScriptSnapshot.bind(
-      info.languageServiceHost,
-    );
+    const languageService = ts.createLanguageService(languageServiceHostProxy);
 
-    const _resolveModuleNames =
-      info.languageServiceHost.resolveModuleNames?.bind(
-        info.languageServiceHost,
-      );
-
-    info.languageServiceHost.getScriptKind = (filename) => {
-      if (!_getScriptKind) {
+    languageServiceHost.getScriptKind = (filename) => {
+      if (!info.languageServiceHost.getScriptKind) {
         return ts.ScriptKind.Unknown;
       }
 
@@ -33,18 +30,125 @@ export = function init(modules: {
         return ts.ScriptKind.TS;
       }
 
-      return _getScriptKind(filename);
+      return info.languageServiceHost.getScriptKind(filename);
     };
 
-    info.languageServiceHost.getScriptSnapshot = (filename) => {
+    languageServiceHost.getScriptSnapshot = (filename) => {
       if (isYaml(filename)) {
         return ts.ScriptSnapshot.fromString(createDts(filename, logger));
       }
-      return _getScriptSnapshot(filename);
+      return info.languageServiceHost.getScriptSnapshot(filename);
     };
 
-    if (_resolveModuleNames) {
-      info.languageServiceHost.resolveModuleNames = (
+    const createModuleResolver =
+      (containingFile: string) =>
+      (
+        moduleName: string,
+        resolveModule: () =>
+          | tsModule.ResolvedModuleWithFailedLookupLocations
+          | undefined,
+      ): tsModule.ResolvedModuleFull | undefined => {
+        if (isYaml(moduleName)) {
+          logger.info(
+            `[typescript-plugin-yaml] resolve ${moduleName} in ${containingFile}`,
+          );
+
+          if (isRelativePath(moduleName)) {
+            return {
+              extension: ts.Extension.Dts,
+              isExternalLibraryImport: false,
+              resolvedFileName: path.resolve(
+                path.dirname(containingFile),
+                moduleName,
+              ),
+            };
+          }
+
+          const resolvedModule = resolveModule();
+          if (!resolvedModule) return;
+
+          const baseUrl = info.project.getCompilerOptions().baseUrl;
+          const match = '/index.ts';
+
+          // An array of paths TypeScript searched for the module. All include .ts, .tsx, .d.ts, or .json extensions.
+          const failedLocations =
+            ((resolvedModule as any)?.failedLookupLocations as string[]) ?? [];
+
+          if (failedLocations.length) {
+            const locations = failedLocations.reduce<string[]>(
+              (locations, location) => {
+                if (
+                  (baseUrl ? location.includes(baseUrl) : true) &&
+                  location.endsWith(match)
+                ) {
+                  locations = [
+                    ...locations,
+                    location.substring(0, location.lastIndexOf(match)),
+                  ];
+                }
+                return locations;
+              },
+              [],
+            );
+
+            const resolvedLocation = locations.find((location) =>
+              fs.existsSync(location),
+            );
+
+            logger.info(
+              `[typescript-plugin-yaml] resolved ${moduleName} in failedLocations: ${resolvedLocation}`,
+            );
+
+            if (resolvedLocation) {
+              return {
+                extension: ts.Extension.Dts,
+                isExternalLibraryImport: false,
+                resolvedFileName: resolvedLocation,
+              };
+            }
+          }
+        }
+      };
+
+    // TypeScript 5.x
+    if (info.languageServiceHost.resolveModuleNameLiterals) {
+      const _resolveModuleNameLiterals =
+        info.languageServiceHost.resolveModuleNameLiterals.bind(
+          info.languageServiceHost,
+        );
+      languageServiceHost.resolveModuleNameLiterals = (
+        moduleNames,
+        containingFile,
+        ...rest
+      ) => {
+        const resolvedModules = _resolveModuleNameLiterals(
+          moduleNames,
+          containingFile,
+          ...rest,
+        );
+
+        const moduleResolver = createModuleResolver(containingFile);
+
+        return moduleNames.map(({ text: moduleName }, index) => {
+          try {
+            const resolvedModule = moduleResolver(
+              moduleName,
+              () => resolvedModules[index],
+            );
+            if (resolvedModule) return { resolvedModule };
+          } catch (e) {
+            return resolvedModules[index];
+          }
+          return resolvedModules[index];
+        });
+      };
+      // TypeScript 4.x
+    } else if (info.languageServiceHost.resolveModuleNames) {
+      const _resolveModuleNames =
+        info.languageServiceHost.resolveModuleNames.bind(
+          info.languageServiceHost,
+        );
+      languageServiceHost.resolveModuleNames = (
         moduleNames,
         containingFile,
         ...rest
@@ -55,71 +159,18 @@ export = function init(modules: {
           ...rest,
         );
 
+        const moduleResolver = createModuleResolver(containingFile);
+
         return moduleNames.map((moduleName, index) => {
           try {
-            if (isYaml(moduleName)) {
-              logger.info(
-                `[typescript-plugin-yaml] resolve ${moduleName} in ${containingFile}`,
-              );
-
-              if (isRelativePath(moduleName)) {
-                return {
-                  extension: ts.Extension.Dts,
-                  isExternalLibraryImport: false,
-                  resolvedFileName: path.resolve(
-                    path.dirname(containingFile),
-                    moduleName,
-                  ),
-                };
-              }
-
-              const failedModule =
-                info.languageServiceHost.getResolvedModuleWithFailedLookupLocationsFromCache?.(
-                  moduleName,
-                  containingFile,
-                );
-              const failedLocations =
-                ((failedModule as any)?.failedLookupLocations as string[]) ??
-                [];
-              const baseUrl = info.project.getCompilerOptions().baseUrl;
-              const match = '/index.ts';
-
-              if (failedLocations.length) {
-                const locations = failedLocations.reduce<string[]>(
-                  (locations, location) => {
-                    if (
-                      (baseUrl ? location.includes(baseUrl) : true) &&
-                      location.endsWith(match)
-                    ) {
-                      locations = [
-                        ...locations,
-                        location.substring(0, location.lastIndexOf(match)),
-                      ];
-                    }
-                    return locations;
-                  },
-                  [],
-                );
-
-                const resolvedLocation = locations.find((location) =>
-                  fs.existsSync(location),
-                );
-
-                logger.info(
-                  `[typescript-plugin-yaml] resolved ${moduleName} in failedLocations: ${resolvedLocation}`,
-                );
-
-                if (resolvedLocation) {
-                  return {
-                    extension: ts.Extension.Dts,
-                    isExternalLibraryImport: false,
-                    resolvedFileName: resolvedLocation,
-                  };
-                }
-              }
-            }
+            const resolvedModule = moduleResolver(moduleName, () =>
+              languageServiceHost.getResolvedModuleWithFailedLookupLocationsFromCache?.(
+                moduleName,
+                containingFile,
+              ),
+            );
+            if (resolvedModule) return resolvedModule;
           } catch (e) {
-            logger.info(`[typescript-plugin-yaml] Resolve Error: ${e}`);
             return resolvedModules[index];
           }
           return resolvedModules[index];
@@ -127,15 +178,15 @@ export = function init(modules: {
       };
     }
 
-    return info.languageService;
+    return languageService;
   }
 
-  function getExternalFiles(proj: ts.server.Project) {
+  function getExternalFiles(proj: tsModule.server.ConfiguredProject) {
     return proj.getFileNames().filter((filename) => isYaml(filename));
   }
 
   return { create, getExternalFiles };
-}
+};
 
 function isYaml(filepath: string) {
   return /\.ya?ml$/.test(filepath);
@@ -145,7 +196,7 @@ function isRelativePath(filepath: string) {
   return /^\.\.?(\/|$)/.test(filepath);
 }
 
-function createDts(filepath: string, logger: ts.server.Logger) {
+function createDts(filepath: string, logger: tsModule.server.Logger) {
   try {
     const content = fs.readFileSync(filepath, 'utf8');
     if (!content.trim().length) {
@@ -157,10 +208,10 @@ function createDts(filepath: string, logger: ts.server.Logger) {
 
     if (Object.prototype.toString.call(doc) === '[object Object]') {
       dts += Object.keys(doc)
-        .filter(key => VALID_VARIABLE_NAME_REGEX.test(key))
+        .filter((key) => VALID_VARIABLE_NAME_REGEX.test(key))
         .map((key) => `export let ${key} = ${JSON.stringify(doc[key])}`)
         .join('\n');
-    } 
+    }
 
     dts += `\nexport default ${JSON.stringify(doc)}`;
 
@@ -170,3 +221,5 @@ function createDts(filepath: string, logger: ts.server.Logger) {
     return `export { }`;
   }
 }
+
+export = init;
