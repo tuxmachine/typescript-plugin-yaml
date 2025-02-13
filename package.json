@@ -34,7 +34,7 @@
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.5.0",
-    "typescript": "^5.5.4"
+    "typescript": "^5.0.0"
   },
   "prettier": {
     "singleQuote": true,
